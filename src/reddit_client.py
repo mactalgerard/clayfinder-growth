@@ -1,9 +1,13 @@
 """
-reddit_client.py — PRAW wrapper for clayfinder-growth social listening.
+reddit_client.py — Reddit public JSON API client for clayfinder-growth.
+
+No API credentials required. Uses Reddit's public JSON endpoints with a
+User-Agent header. Rate limit: ~1 request/second for unauthenticated access.
 
 Provides:
-  - build_reddit_client(): instantiate read-only PRAW client
+  - build_session(): create a requests.Session with User-Agent set
   - search_subreddit(): search one subreddit for one search term
+  - get_thread_context(): fetch selftext + top comments for a thread
   - RedditThread: dataclass representing a fetched thread
 """
 
@@ -13,12 +17,15 @@ import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from urllib.parse import urlencode
 
-import praw
-import prawcore.exceptions
+import requests
 from rich.console import Console
 
 console = Console()
+
+REDDIT_BASE = "https://www.reddit.com"
+REQUEST_DELAY = 1.0  # seconds between requests — stay within public rate limit
 
 QUESTION_KEYWORDS = [
     "recommend",
@@ -42,11 +49,11 @@ QUESTION_KEYWORDS = [
 
 @dataclass
 class RedditThread:
-    id: str                          # PRAW submission.id — stable identifier, used for dedup
+    id: str                          # Reddit submission id — used for dedup
     subreddit: str                   # e.g. "Pottery"
     title: str
     url: str                         # Full reddit.com permalink
-    selftext: str                    # Body text (empty string for link posts or deleted posts)
+    selftext: str                    # Body text (empty for link posts or deleted)
     score: int                       # Net upvotes
     num_comments: int
     created_utc: float               # Unix timestamp
@@ -56,40 +63,25 @@ class RedditThread:
     search_term: str = ""            # Which search term surfaced this thread
 
 
-def build_reddit_client() -> praw.Reddit:
+def build_session() -> requests.Session:
     """
-    Instantiate a read-only PRAW client from environment variables.
+    Build a requests.Session with a User-Agent header.
 
-    Required env vars: REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USER_AGENT.
-    Raises RuntimeError if any are missing.
+    User-Agent is read from the REDDIT_USER_AGENT env var.
+    Falls back to a sensible default if not set.
+    No Reddit API credentials are needed.
     """
-    client_id = os.environ.get("REDDIT_CLIENT_ID")
-    client_secret = os.environ.get("REDDIT_CLIENT_SECRET")
-    user_agent = os.environ.get("REDDIT_USER_AGENT")
-
-    missing = [k for k, v in {
-        "REDDIT_CLIENT_ID": client_id,
-        "REDDIT_CLIENT_SECRET": client_secret,
-        "REDDIT_USER_AGENT": user_agent,
-    }.items() if not v]
-
-    if missing:
-        raise RuntimeError(
-            f"Missing required environment variables: {', '.join(missing)}\n"
-            "Copy .env.example to .env and fill in your Reddit credentials."
-        )
-
-    return praw.Reddit(
-        client_id=client_id,
-        client_secret=client_secret,
-        user_agent=user_agent,
-        read_only=True,
-        ratelimit_seconds=1,
+    user_agent = os.environ.get(
+        "REDDIT_USER_AGENT",
+        "clayfinder-growth:v1.0 (by /u/feltlucky_justhappy)",
     )
+    session = requests.Session()
+    session.headers.update({"User-Agent": user_agent})
+    return session
 
 
 def search_subreddit(
-    reddit: praw.Reddit,
+    session: requests.Session,
     subreddit_name: str,
     search_term: str,
     limit: int = 25,
@@ -97,15 +89,16 @@ def search_subreddit(
     seen_ids: set[str] | None = None,
 ) -> list[RedditThread]:
     """
-    Search one subreddit for one search term and return matching threads.
+    Search one subreddit for one search term via the public JSON API.
 
+    Endpoint: GET /r/{subreddit}/search.json
     Filters applied:
       - Threads older than `days` are skipped
       - Threads with score < 3 are skipped
-      - Threads whose id is already in `seen_ids` are skipped (deduplication)
-      - Thread ids that pass are added to `seen_ids` in-place
+      - Threads already in `seen_ids` are skipped (deduplication)
+      - Passing thread ids are added to `seen_ids` in-place
 
-    Returns an empty list (with a warning) on any Reddit API error.
+    Returns an empty list (with a warning logged) on any API error.
     """
     if seen_ids is None:
         seen_ids = set()
@@ -114,104 +107,168 @@ def search_subreddit(
     threads: list[RedditThread] = []
     now = datetime.now(timezone.utc).timestamp()
 
-    try:
-        subreddit = reddit.subreddit(subreddit_name)
-        results = subreddit.search(
-            query=search_term,
-            sort="relevance",
-            time_filter=time_filter,
-            limit=limit,
+    params = {
+        "q": search_term,
+        "sort": "relevance",
+        "t": time_filter,
+        "limit": min(limit, 100),  # Reddit caps at 100
+        "restrict_sr": "1",        # Restrict to this subreddit only
+        "type": "link",
+    }
+    url = f"{REDDIT_BASE}/r/{subreddit_name}/search.json?{urlencode(params)}"
+
+    for attempt in range(2):
+        try:
+            resp = session.get(url, timeout=15)
+
+            if resp.status_code == 404:
+                console.print(f"  [yellow]Warning:[/yellow] r/{subreddit_name} does not exist — skipping")
+                return []
+            if resp.status_code == 403:
+                console.print(f"  [yellow]Warning:[/yellow] r/{subreddit_name} is private — skipping")
+                return []
+            if resp.status_code == 429:
+                if attempt == 0:
+                    console.print(f"  [yellow]Warning:[/yellow] Rate limited on r/{subreddit_name} — waiting 60s")
+                    time.sleep(60)
+                    continue
+                console.print(f"  [yellow]Warning:[/yellow] Rate limited on r/{subreddit_name} after retry — skipping")
+                return []
+
+            resp.raise_for_status()
+            data = resp.json()
+            break
+
+        except requests.RequestException as e:
+            console.print(f"  [yellow]Warning:[/yellow] Request failed for r/{subreddit_name}: {e}")
+            return []
+    else:
+        return []
+
+    time.sleep(REQUEST_DELAY)
+
+    children = data.get("data", {}).get("children", [])
+
+    for child in children:
+        post = child.get("data", {})
+        post_id = post.get("id", "")
+
+        if not post_id or post_id in seen_ids:
+            continue
+
+        # Age filter
+        created_utc = float(post.get("created_utc", 0))
+        age_days = (now - created_utc) / 86400
+        if age_days > days:
+            seen_ids.add(post_id)
+            continue
+
+        # Score filter
+        score = int(post.get("score", 0))
+        if score < 3:
+            seen_ids.add(post_id)
+            continue
+
+        # Normalise selftext
+        selftext = post.get("selftext", "") or ""
+        if selftext in ("[deleted]", "[removed]"):
+            selftext = ""
+
+        permalink = post.get("permalink", "")
+        full_url = f"{REDDIT_BASE}{permalink}" if permalink else ""
+
+        # Fetch comments for context
+        _, top_comments = get_thread_context(session, subreddit_name, post_id)
+
+        # Check clayfinder mention
+        title = post.get("title", "")
+        mentions_cf = _mentions_clayfinder(title, selftext, top_comments)
+
+        thread = RedditThread(
+            id=post_id,
+            subreddit=subreddit_name,
+            title=title,
+            url=full_url,
+            selftext=selftext,
+            score=score,
+            num_comments=int(post.get("num_comments", 0)),
+            created_utc=created_utc,
+            age_days=round(age_days, 1),
+            top_comments=top_comments,
+            mentions_clayfinder=mentions_cf,
+            search_term=search_term,
         )
 
-        for submission in results:
-            # Deduplication
-            if submission.id in seen_ids:
-                continue
-
-            # Age filter
-            age_days = (now - submission.created_utc) / 86400
-            if age_days > days:
-                seen_ids.add(submission.id)  # Mark seen so we don't reprocess
-                continue
-
-            # Score filter
-            if submission.score < 3:
-                seen_ids.add(submission.id)
-                continue
-
-            # Fetch full context (selftext + top comments)
-            selftext, top_comments = get_thread_context(submission)
-
-            # Check for clayfinder mention
-            mentions_cf = _mentions_clayfinder(submission)
-
-            thread = RedditThread(
-                id=submission.id,
-                subreddit=subreddit_name,
-                title=submission.title,
-                url=f"https://reddit.com{submission.permalink}",
-                selftext=selftext,
-                score=submission.score,
-                num_comments=submission.num_comments,
-                created_utc=submission.created_utc,
-                age_days=round(age_days, 1),
-                top_comments=top_comments,
-                mentions_clayfinder=mentions_cf,
-                search_term=search_term,
-            )
-
-            seen_ids.add(submission.id)
-            threads.append(thread)
-
-    except prawcore.exceptions.Redirect:
-        console.print(f"  [yellow]Warning:[/yellow] r/{subreddit_name} does not exist — skipping")
-    except prawcore.exceptions.Forbidden:
-        console.print(f"  [yellow]Warning:[/yellow] r/{subreddit_name} is private — skipping")
-    except prawcore.exceptions.TooManyRequests:
-        console.print(f"  [yellow]Warning:[/yellow] Rate limited on r/{subreddit_name} — waiting 60s")
-        time.sleep(60)
-    except prawcore.exceptions.PrawcoreException as e:
-        console.print(f"  [yellow]Warning:[/yellow] Reddit API error on r/{subreddit_name}: {e}")
+        seen_ids.add(post_id)
+        threads.append(thread)
 
     return threads
 
 
-def get_thread_context(submission) -> tuple[str, list[str]]:
+def get_thread_context(
+    session: requests.Session,
+    subreddit: str,
+    thread_id: str,
+) -> tuple[str, list[str]]:
     """
-    Return (selftext, top_5_comment_bodies) for a PRAW submission.
+    Fetch selftext and top 5 comments for a thread via the public JSON API.
 
-    Uses replace_more(limit=0) to avoid triggering extra API calls for
-    MoreComments objects. Comments are sorted by score descending.
-    Handles deleted/removed posts by treating them as empty strings.
+    Endpoint: GET /r/{subreddit}/comments/{id}.json
+    Response is a 2-element list:
+      [0] post listing (already have this data — used for selftext fallback)
+      [1] comments listing — data.children[*].data with .body and .score
+
+    Returns (selftext, top_5_comment_bodies_by_score).
+    Handles deleted/removed bodies by treating them as empty strings.
     """
-    # Normalise selftext
-    selftext = submission.selftext or ""
-    if selftext in ("[deleted]", "[removed]"):
+    url = f"{REDDIT_BASE}/r/{subreddit}/comments/{thread_id}.json"
+
+    try:
+        resp = session.get(url, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        time.sleep(REQUEST_DELAY)
+    except Exception:
+        return "", []
+
+    # data[0] = post listing, data[1] = comments listing
+    if not isinstance(data, list) or len(data) < 2:
+        return "", []
+
+    # Extract selftext from post listing (fallback)
+    try:
+        post_data = data[0]["data"]["children"][0]["data"]
+        selftext = post_data.get("selftext", "") or ""
+        if selftext in ("[deleted]", "[removed]"):
+            selftext = ""
+    except (KeyError, IndexError):
         selftext = ""
 
-    # Fetch top comments without expanding MoreComments
+    # Extract top comments
     try:
-        submission.comments.replace_more(limit=0)
-        all_comments = submission.comments.list()
-        # Sort by score, take top 5
-        sorted_comments = sorted(
-            all_comments,
-            key=lambda c: getattr(c, "score", 0),
-            reverse=True,
-        )
-        top_comments = []
-        for comment in sorted_comments[:5]:
-            body = getattr(comment, "body", "")
-            if body and body not in ("[deleted]", "[removed]"):
-                top_comments.append(body)
-    except Exception:
+        comment_children = data[1]["data"]["children"]
+        comments = []
+        for child in comment_children:
+            if child.get("kind") != "t1":
+                continue
+            cdata = child.get("data", {})
+            body = cdata.get("body", "") or ""
+            if body in ("[deleted]", "[removed]", ""):
+                continue
+            score = int(cdata.get("score", 0))
+            comments.append((score, body))
+
+        # Sort by score descending, take top 5
+        comments.sort(key=lambda x: x[0], reverse=True)
+        top_comments = [body for _, body in comments[:5]]
+    except (KeyError, TypeError):
         top_comments = []
 
     return selftext, top_comments
 
 
 def _days_to_time_filter(days: int) -> str:
-    """Map a --days integer to the nearest PRAW time_filter string."""
+    """Map a --days integer to the nearest Reddit time filter string."""
     if days <= 1:
         return "day"
     if days <= 7:
@@ -223,35 +280,22 @@ def _days_to_time_filter(days: int) -> str:
     return "all"
 
 
-def _mentions_clayfinder(submission) -> bool:
+def _mentions_clayfinder(title: str, selftext: str, comments: list[str]) -> bool:
     """
-    Return True if "clayfinder" appears anywhere in the thread
-    (title, selftext, or any comment body). Case-insensitive.
+    Return True if "clayfinder" appears anywhere in the thread.
+    Case-insensitive substring check across title, body, and all comments.
     """
     needle = "clayfinder"
-
-    if needle in submission.title.lower():
+    if needle in title.lower():
         return True
-
-    selftext = submission.selftext or ""
     if needle in selftext.lower():
         return True
-
-    try:
-        submission.comments.replace_more(limit=0)
-        for comment in submission.comments.list():
-            body = getattr(comment, "body", "") or ""
-            if needle in body.lower():
-                return True
-    except Exception:
-        pass
-
-    return False
+    return any(needle in c.lower() for c in comments)
 
 
 def is_show_and_tell(thread: RedditThread) -> bool:
     """
-    Heuristic to detect show-and-tell / gallery posts that have no question.
+    Heuristic to detect show-and-tell / gallery posts with no question.
 
     Returns True (exclude this thread) if ALL of:
       1. No "?" in the title
@@ -262,16 +306,13 @@ def is_show_and_tell(thread: RedditThread) -> bool:
     """
     title_lower = thread.title.lower()
 
-    has_question_mark = "?" in thread.title
-    if has_question_mark:
+    if "?" in thread.title:
         return False
 
-    has_question_keyword = any(kw in title_lower for kw in QUESTION_KEYWORDS)
-    if has_question_keyword:
+    if any(kw in title_lower for kw in QUESTION_KEYWORDS):
         return False
 
-    body_is_short = len(thread.selftext.strip()) < 30
-    if not body_is_short:
+    if len(thread.selftext.strip()) >= 30:
         return False
 
     return True

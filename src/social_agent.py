@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.reddit_client import (
     RedditThread,
-    build_reddit_client,
+    build_session,
     is_show_and_tell,
     search_subreddit,
 )
@@ -377,12 +377,8 @@ def run(args: argparse.Namespace) -> None:
             expand=False,
         ))
 
-    # Build Reddit client
-    try:
-        reddit = build_reddit_client()
-    except RuntimeError as e:
-        console.print(f"[red]Error:[/red] {e}")
-        sys.exit(1)
+    # Build Reddit session (no credentials needed)
+    reddit = build_session()
 
     # Determine subreddit list
     subreddits = [args.subreddit] if args.subreddit else TARGET_SUBREDDITS
