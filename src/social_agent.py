@@ -284,6 +284,25 @@ def draft_response(
 # Report generation
 # ---------------------------------------------------------------------------
 
+CONFIDENCE_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+
+
+def build_output_filename(args: argparse.Namespace) -> str:
+    """
+    Build a descriptive filename slug from the run parameters.
+
+    Examples:
+      --subreddit Pottery              → opportunities_pottery_2026-04-06.md
+      --subreddit Pottery --dry-run    → opportunities_pottery_dry_2026-04-06.md
+      (full run)                       → opportunities_all_2026-04-06.md
+      (full run --dry-run)             → opportunities_all_dry_2026-04-06.md
+    """
+    scope = args.subreddit.lower() if args.subreddit else "all"
+    dry = "_dry" if args.dry_run else ""
+    date = datetime.now().strftime("%Y-%m-%d")
+    return f"opportunities_{scope}{dry}_{date}.md"
+
+
 def format_age(age_days: float) -> str:
     if age_days < 1:
         hours = int(age_days * 24)
@@ -437,13 +456,10 @@ def run(args: argparse.Namespace) -> None:
     if not filtered:
         console.print("[yellow]No threads passed filters. Try increasing --days or --limit.[/yellow]")
         # Still write an empty report
-        output_path = OUTPUTS_DIR / f"opportunities_{datetime.now().strftime('%Y-%m-%d')}.md"
+        output_path = OUTPUTS_DIR / build_output_filename(args)
         write_report([], output_path, dry_run=args.dry_run, failed_subreddits=failed_subreddits)
         console.print(f"\nReport written to [bold]{output_path}[/bold]")
         return
-
-    # Sort by priority
-    filtered.sort(key=score_thread, reverse=True)
 
     # Classify confidence and build opportunity list
     opportunities = []
@@ -455,6 +471,11 @@ def run(args: argparse.Namespace) -> None:
             "why": why_reason(thread, confidence),
             "drafted_response": "",
         })
+
+    # Sort: HIGH → MEDIUM → LOW, then by score within each group
+    opportunities.sort(
+        key=lambda o: (CONFIDENCE_ORDER[o["confidence"]], -score_thread(o["thread"]))
+    )
 
     # Draft responses via Claude
     if args.dry_run:
@@ -494,7 +515,7 @@ def run(args: argparse.Namespace) -> None:
                 progress.advance(task)
 
     # Write report
-    output_path = OUTPUTS_DIR / f"opportunities_{datetime.now().strftime('%Y-%m-%d')}.md"
+    output_path = OUTPUTS_DIR / build_output_filename(args)
     write_report(
         opportunities,
         output_path,
