@@ -71,31 +71,10 @@ MAX_TOKENS = 512
 OUTPUTS_DIR = Path("outputs")
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
-RECOMMENDATION_KEYWORDS = [
-    "recommend",
-    "looking for",
-    "where to find",
-    "best ",
-    "suggestions",
-    "any good",
-    "how do i find",
-    "help me find",
-    "trying to find",
-]
-
-HIGH_CONFIDENCE_PHRASES = [
-    "can anyone recommend",
-    "looking for classes",
-    "looking for studios",
-    "where to find",
-    "how do i find",
-    "trying to find",
-    "need to find",
-    "any recommendations",
-    "any suggestions",
-    "where can i",
-    "help finding",
-]
+# Broad subreddits where we require pottery keywords in title/body
+# to avoid false positives from unrelated threads
+BROAD_SUBREDDITS = {"AskMen", "AskWomen", "Frugal", "moving", "AskReddit", "Hobbyists"}
+POTTERY_KEYWORDS = ["potter", "ceramic", "kiln", "wheel throw", "clay", "glaze", "studio"]
 
 
 # ---------------------------------------------------------------------------
@@ -142,19 +121,14 @@ def parse_args() -> argparse.Namespace:
 
 def score_thread(thread: RedditThread) -> int:
     """
-    Priority score for sorting. Higher = more worth engaging with.
+    Priority score for sorting before Claude drafting. Higher = more worth engaging with.
 
-    +3  explicit recommendation request in title
     +2  score >= 50
     +1  score >= 10
     +1  num_comments >= 5
     -1  age_days > 14
     """
     s = 0
-    title_lower = thread.title.lower()
-
-    if any(kw in title_lower for kw in RECOMMENDATION_KEYWORDS):
-        s += 3
 
     if thread.score >= 50:
         s += 2
@@ -168,48 +142,6 @@ def score_thread(thread: RedditThread) -> int:
         s -= 1
 
     return s
-
-
-def classify_confidence(thread: RedditThread) -> str:
-    """
-    HIGH   — explicit recommendation or resource request
-    MEDIUM — general question with relevance to finding studios
-    LOW    — tangential or weak match
-    """
-    title_lower = thread.title.lower()
-    body_lower = thread.selftext.lower()
-    combined = title_lower + " " + body_lower
-
-    if any(phrase in combined for phrase in HIGH_CONFIDENCE_PHRASES):
-        return "HIGH"
-
-    if "?" in thread.title and any(kw in title_lower for kw in RECOMMENDATION_KEYWORDS):
-        return "HIGH"
-
-    if "pottery" in combined or "ceramics" in combined or "studio" in combined:
-        if "?" in thread.title:
-            return "MEDIUM"
-        if len(thread.selftext.strip()) > 50:
-            return "MEDIUM"
-
-    return "LOW"
-
-
-def why_reason(thread: RedditThread, confidence: str) -> str:
-    """One-line explanation of why this thread is an opportunity."""
-    title_lower = thread.title.lower()
-
-    if confidence == "HIGH":
-        if any(p in title_lower for p in ["recommend", "suggestion", "where"]):
-            return "Direct recommendation request — person is actively looking for a studio or class."
-        return "High-intent question about finding pottery resources."
-
-    if confidence == "MEDIUM":
-        if thread.score >= 20:
-            return f"General pottery question with good reach ({thread.score} upvotes, {thread.num_comments} comments)."
-        return "Beginner or discovery question — good community engagement opportunity."
-
-    return "Tangential pottery discussion — low-effort community presence reply."
 
 
 # ---------------------------------------------------------------------------
@@ -248,12 +180,19 @@ def draft_response(
     client: anthropic.Anthropic,
     thread: RedditThread,
     system_prompt: str,
-) -> str:
+) -> tuple[str, bool, str]:
     """
-    Call Claude to draft an engagement response for the given thread.
+    Call Claude to assess and draft an engagement response for the given thread.
 
-    Retries once on rate limit (waits 60s). Returns an error placeholder
-    on other API failures so the report can still be written.
+    Claude returns a structured response with:
+      CONFIDENCE: HIGH|MEDIUM|LOW
+      INCLUDE_LINK: YES|NO
+
+      [comment text]
+
+    Returns (confidence, include_link, response_text).
+    On failure returns ("LOW", False, "[drafting failed — ...]").
+    Retries once on rate limit (waits 60s).
     """
     user_message = build_user_message(thread)
 
@@ -265,19 +204,55 @@ def draft_response(
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_message}],
             )
-            return response.content[0].text.strip()
+            raw = response.content[0].text.strip()
+            return _parse_claude_response(raw)
 
         except anthropic.RateLimitError:
             if attempt == 0:
                 console.print("  [yellow]Rate limited — waiting 60s before retry...[/yellow]")
                 time.sleep(60)
             else:
-                return "[drafting failed — rate limit exceeded]"
+                return ("LOW", False, "[drafting failed — rate limit exceeded]")
 
         except anthropic.APIError as e:
-            return f"[drafting failed — API error: {e}]"
+            return ("LOW", False, f"[drafting failed — API error: {e}]")
 
-    return "[drafting failed — unknown error]"
+    return ("LOW", False, "[drafting failed — unknown error]")
+
+
+def _parse_claude_response(raw: str) -> tuple[str, bool, str]:
+    """
+    Parse Claude's structured response into (confidence, include_link, response_text).
+
+    Expected format:
+      CONFIDENCE: HIGH
+      INCLUDE_LINK: YES
+
+      [comment text here]
+
+    Falls back gracefully if headers are missing.
+    """
+    lines = raw.splitlines()
+    confidence = "LOW"
+    include_link = False
+    text_start = 0
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("CONFIDENCE:"):
+            value = stripped.split(":", 1)[1].strip().upper()
+            if value in ("HIGH", "MEDIUM", "LOW"):
+                confidence = value
+        elif stripped.startswith("INCLUDE_LINK:"):
+            value = stripped.split(":", 1)[1].strip().upper()
+            include_link = value == "YES"
+        elif stripped == "" and i <= 3:
+            # Blank line after headers — response text starts after this
+            text_start = i + 1
+            break
+
+    response_text = "\n".join(lines[text_start:]).strip()
+    return (confidence, include_link, response_text)
 
 
 # ---------------------------------------------------------------------------
@@ -325,12 +300,12 @@ def write_report(
 
     today = datetime.now().strftime("%Y-%m-%d")
     lines = [
-        f"# Social Listening Opportunities — {today}",
+        f"# Social Listening Opportunities: {today}",
         "",
     ]
 
     if dry_run:
-        lines += ["**DRY RUN** — Claude drafting was skipped. Reddit data only.", ""]
+        lines += ["**DRY RUN** - Claude drafting was skipped. Reddit data only.", ""]
 
     if failed_subreddits:
         lines += [
@@ -352,8 +327,9 @@ def write_report(
     for i, opp in enumerate(opportunities, 1):
         thread: RedditThread = opp["thread"]
         confidence: str = opp["confidence"]
-        why: str = opp["why"]
+        include_link: bool = opp.get("include_link", False)
         response: str = opp["drafted_response"]
+        link_label = "YES" if include_link else "NO"
 
         lines += [
             f"## Opportunity #{i}",
@@ -361,9 +337,7 @@ def write_report(
             f'**Thread:** "{thread.title}"',
             f"**URL:** {thread.url}",
             f"**Posted:** {format_age(thread.age_days)} | {thread.score} upvotes | {thread.num_comments} comments",
-            f"**Confidence:** {confidence}",
-            "",
-            f"**Why:** {why}",
+            f"**Confidence:** {confidence} | **Link:** {link_label}",
             "",
             "**Drafted Response:**",
             "---",
@@ -441,10 +415,18 @@ def run(args: argparse.Namespace) -> None:
     console.print(f"Fetched [bold]{len(all_threads)}[/bold] unique threads before filtering")
 
     # Apply filters
-    filtered = [
-        t for t in all_threads
-        if not t.mentions_clayfinder and not is_show_and_tell(t)
-    ]
+    filtered = []
+    for t in all_threads:
+        if t.mentions_clayfinder:
+            continue
+        if is_show_and_tell(t):
+            continue
+        # For broad subreddits, require pottery keywords in title or body
+        if t.subreddit in BROAD_SUBREDDITS:
+            combined = (t.title + " " + t.selftext).lower()
+            if not any(kw in combined for kw in POTTERY_KEYWORDS):
+                continue
+        filtered.append(t)
 
     removed = len(all_threads) - len(filtered)
     console.print(
@@ -461,23 +443,16 @@ def run(args: argparse.Namespace) -> None:
         console.print(f"\nReport written to [bold]{output_path}[/bold]")
         return
 
-    # Classify confidence and build opportunity list
-    opportunities = []
-    for thread in filtered:
-        confidence = classify_confidence(thread)
-        opportunities.append({
-            "thread": thread,
-            "confidence": confidence,
-            "why": why_reason(thread, confidence),
-            "drafted_response": "",
-        })
+    # Sort by score before Claude (rough priority — Claude will reclassify)
+    filtered.sort(key=score_thread, reverse=True)
 
-    # Sort: HIGH → MEDIUM → LOW, then by score within each group
-    opportunities.sort(
-        key=lambda o: (CONFIDENCE_ORDER[o["confidence"]], -score_thread(o["thread"]))
-    )
+    # Build initial opportunity list (confidence assigned by Claude during drafting)
+    opportunities = [
+        {"thread": t, "confidence": "LOW", "include_link": False, "drafted_response": ""}
+        for t in filtered
+    ]
 
-    # Draft responses via Claude
+    # Draft responses via Claude — Claude assigns confidence and link decision
     if args.dry_run:
         for opp in opportunities:
             opp["drafted_response"] = "[dry-run — Claude not called]"
@@ -511,8 +486,16 @@ def run(args: argparse.Namespace) -> None:
                     task,
                     description=f"Drafting {i}/{len(opportunities)}: {thread.title[:60]}...",
                 )
-                opp["drafted_response"] = draft_response(client, thread, system_prompt)
+                confidence, include_link, response_text = draft_response(client, thread, system_prompt)
+                opp["confidence"] = confidence
+                opp["include_link"] = include_link
+                opp["drafted_response"] = response_text
                 progress.advance(task)
+
+        # Re-sort after Claude has classified everything: HIGH → MEDIUM → LOW
+        opportunities.sort(
+            key=lambda o: (CONFIDENCE_ORDER[o["confidence"]], -score_thread(o["thread"]))
+        )
 
     # Write report
     output_path = OUTPUTS_DIR / build_output_filename(args)

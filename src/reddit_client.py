@@ -27,23 +27,44 @@ console = Console()
 REDDIT_BASE = "https://www.reddit.com"
 REQUEST_DELAY = 1.0  # seconds between requests — stay within public rate limit
 
+
+# Words that indicate someone is genuinely asking a question (not just sharing)
 QUESTION_KEYWORDS = [
     "recommend",
     "looking for",
     "where",
-    "best",
     "find",
     "help",
     "advice",
     "suggestion",
-    "beginner",
-    "start",
     "how",
-    "any",
-    "anyone",
     "can i",
     "should i",
     "which",
+    "what should",
+    "any tips",
+    "any advice",
+    "critique",
+    "criticism",
+    "opinions",
+    "thoughts",
+    "is this",
+    "worth it",
+]
+
+# Title patterns that strongly indicate a sharing/show-and-tell post
+SHOW_AND_TELL_STARTERS = [
+    "my first",
+    "my very first",
+    "first ever",
+    "finished my",
+    "some items i",
+    "pieces from my",
+    "work in process",
+    "work in progress",
+    "an update on",
+    "took my first",
+    "update on",
 ]
 
 
@@ -297,15 +318,17 @@ def is_show_and_tell(thread: RedditThread) -> bool:
     """
     Heuristic to detect show-and-tell / gallery posts with no question.
 
-    Returns True (exclude this thread) if ALL of:
-      1. No "?" in the title
-      2. No question keywords in the title (case-insensitive)
-      3. Body text is empty or under 30 characters
-
-    A post needs to fail only one condition to be kept.
+    Returns True (exclude) if the title matches a known sharing pattern,
+    OR if all of: no "?", no question keywords, and body under 30 chars.
     """
     title_lower = thread.title.lower()
 
+    # Hard exclude: title starts with a known sharing phrase and no question mark
+    if "?" not in thread.title:
+        if any(title_lower.startswith(pat) for pat in SHOW_AND_TELL_STARTERS):
+            return True
+
+    # Soft exclude: no question marker, no question keyword, no substantial body
     if "?" in thread.title:
         return False
 
